@@ -63,6 +63,96 @@ def clean_noise(text: str) -> str:
     return text.strip()
 
 
+# Detecta el patrón de monto NCR: "B/.12.34" o "B/.1,036.70" (con coma de miles).
+# Solo aparecen al final de las filas de items, justo antes del "Transfer Total".
+_MONEY_RE = re.compile(r"B/\.\s*\d{1,3}(?:,\d{3})*\.\d{2}")
+# Detecta el inicio típico de un item: descripción en PascalCase, sin monto al final.
+_ITEM_START_RE = re.compile(r"^[A-ZÁÉÍÓÚÑ]")
+# Detecta el inicio de una fila de item "completa" tras un posible pegado:
+# categoria conocida + número (quantity) en una posición fija de la línea.
+_ROW_HAS_QTY_RE = re.compile(
+    r"\b(Alimentos|Papeleria|Operaciones|Limpieza)\b"
+    r"\s+\d{1,6}\.\d{2}\s+(?:CA|CA |BO|BL|PQ|BOLSA|UN|LBS|LB|OZ)",
+    re.IGNORECASE,
+)
+
+
+def join_broken_lines(text: str) -> str:
+    """Une líneas partidas por ``pypdf`` dentro de la misma celda del PDF.
+
+    El layout mode de pypdf suele romper una fila en dos cuando la columna
+    ``unit_transferred`` o ``description`` no entra en el ancho de página.
+    Por ejemplo::
+
+        Empanizador para Pollo WD 1/40LB          Alimentos   1.00  Bulto = 20 LB
+        (2/20)                                                                 B/.35.45
+
+    o::
+
+        Pan Glazzed PREMIUM BUN 4 WD
+        8/30un (240un)                          Alimentos   3.00  CA=8/30 UN    B/.149.85
+
+    Esto confunde a Ollama al alinear columnas, dejando ``unit_transferred``
+    truncado y ``cost_unit`` con números sin sentido. La heurística:
+
+    1. Si una línea no contiene monto ``B/.X.XX`` y la siguiente SÍ contiene
+       un monto, son la misma fila → concatenar con un espacio.
+    2. Si una línea empieza con ``(`` (coletilla tipo ``(2/20)``, ``(720un)``,
+       ``(CA=24/50)``), es continuación de la línea previa → concatenar.
+    3. Si la línea actual parece un item completo (category + qty + unit en
+       la misma línea), NO es continuación aunque la anterior no tuviera
+       monto — es un item nuevo mal alineado.
+
+    El cierre de transferencia (``Transfer Total: B/.X.XX``) se preserva
+    intacto porque la heurística (1) no une líneas que ya contienen monto
+    y la (3) requiere el patrón completo de fila de item.
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    for line in lines:
+        if not out:
+            out.append(line)
+            continue
+        prev = out[-1]
+        has_money_prev = bool(_MONEY_RE.search(prev))
+        has_money_curr = bool(_MONEY_RE.search(line))
+        stripped = line.lstrip()
+
+        # La línea actual ES una fila de item completa (category + qty + unit).
+        # NO es continuación: es un item nuevo mal alineado por pypdf.
+        # Esto arregla el caso "Wendys 6/6 LB Pollo Rosty 9/18 UN ..." donde
+        # la coletilla "Wendys 6/6 LB" se pegó al inicio del item siguiente.
+        if _ROW_HAS_QTY_RE.search(line):
+            out.append(line)
+            continue
+
+        # Regla 2: coletilla entre paréntesis al inicio de la línea
+        if stripped.startswith("(") and not has_money_curr and not has_money_prev:
+            out[-1] = f"{prev} {stripped}"
+            continue
+
+        # Regla 1: la línea previa NO terminó con monto, esta SÍ
+        # → es la misma fila partida
+        if (not has_money_prev) and has_money_curr:
+            # sanity: la línea actual debe ser "corta" o terminar en monto
+            # (no debe empezar con un "Transfer:" que sea un nuevo bloque)
+            if not re.match(r"^Transfer\s*[:ID-]", stripped):
+                out[-1] = f"{prev} {stripped}"
+                continue
+
+        # Regla 3 (legacy): línea sin monto, sin mayúscula → continuación
+        if (not has_money_curr) and stripped and not _ITEM_START_RE.match(stripped):
+            if not re.match(r"^(Transfer\s+(In|Out)\s+Total|Net\s+Transfer)", stripped):
+                if not has_money_prev:
+                    out[-1] = f"{prev} {stripped}"
+                    continue
+
+        out.append(line)
+    return "\n".join(out)
+
+
 def extract_text(pdf_path: str | Path, *, layout: bool = True) -> str:
     """Lee el PDF y devuelve el texto concatenado de todas las páginas.
 
@@ -112,7 +202,7 @@ def split_sections(full_text: str) -> dict[str, str]:
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
         raw = full_text[start:end].strip()
-        sections[f"transfer_{kind.lower()}"] = clean_noise(raw)
+        sections[f"transfer_{kind.lower()}"] = join_broken_lines(clean_noise(raw))
     sections.setdefault("transfer_in", "")
     sections.setdefault("transfer_out", "")
     return sections
@@ -146,6 +236,6 @@ def split_stores(section_text: str) -> list[dict]:
             continue
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(section_text)
-        texto = clean_noise(section_text[start:end].strip())
+        texto = join_broken_lines(clean_noise(section_text[start:end].strip()))
         blocks.append({"tienda": tienda, "texto": texto})
     return blocks
