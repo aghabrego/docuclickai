@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Entry point ejecutable de DocuClickAI.
+
+Uso:
+    ./docuclickai --pdf ruta/al.pdf [--out transfers.json]
+
+Salida por defecto: ``<proyecto>/output/transfers.json``.
+Artefactos intermedios: ``<proyecto>/tmp/session_<ts>_<token>/``.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Permite ejecutar tanto como entry point (./docuclickai) como módulo.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from main import DEFAULT_MODEL, DEFAULT_HOST, parse_args, run, SchemaError  # noqa: E402
+from ollama_client import OllamaError  # noqa: E402
+from tmp_manager import lazy_cleanup, new_session_dir, write_artifact  # noqa: E402
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_OUT = PROJECT_ROOT / "output" / "transfers.json"
+
+
+def make_logger(session_dir):
+    def _log(name: str, content: str) -> None:
+        suffix = "json" if name.startswith("ollama_") else "txt"
+        try:
+            write_artifact(session_dir, name, content, suffix=suffix)
+        except Exception:  # noqa: BLE001
+            pass
+    return _log
+
+
+def main() -> int:
+    args = parse_args(sys.argv[1:])
+    out_path = args.out if args.out else DEFAULT_OUT
+
+    removed = lazy_cleanup(PROJECT_ROOT)
+    if removed:
+        print(f"[tmp] {removed} entrada(s) antiguas purgadas (>24h).", flush=True)
+    session = new_session_dir(PROJECT_ROOT)
+    print(f"[tmp] sesión: {session.relative_to(PROJECT_ROOT)}", flush=True)
+
+    try:
+        run(args.pdf, out_path, model=args.model, host=args.host,
+            timeout=args.timeout, max_retries=args.max_retries,
+            log=make_logger(session))
+    except SchemaError as exc:
+        print(f"Error de esquema: {exc}", file=sys.stderr)
+        return 2
+    except OllamaError as exc:
+        print(f"Error Ollama: {exc}", file=sys.stderr)
+        return 3
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
