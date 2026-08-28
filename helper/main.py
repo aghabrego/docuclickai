@@ -269,17 +269,22 @@ def _process_one_store(
     bloques = _split_store_into_transfers(store_text)
     if not bloques:
         # Fallback al comportamiento de bloque único (texto sin marcadores Transfer)
-        return _process_store_block(tienda, store_text, transfer_meta=None,
-                                    model=model, host=host, timeout=timeout,
-                                    max_retries=max_retries, log=log)
+        transferencias = _process_store_block(
+            tienda, store_text, transfer_meta=None,
+            model=model, host=host, timeout=timeout,
+            max_retries=max_retries, log=log,
+        ) or []
+        return _wrap_store(tienda, transferencias)
 
     transferencias: list = []
     for meta, bloque_texto in bloques:
-        tr = _process_store_block(tienda, bloque_texto, transfer_meta=meta,
-                                  model=model, host=host, timeout=timeout,
-                                  max_retries=max_retries, log=log)
-        if tr:
-            transferencias.append(tr)
+        trs = _process_store_block(
+            tienda, bloque_texto, transfer_meta=meta,
+            model=model, host=host, timeout=timeout,
+            max_retries=max_retries, log=log,
+        )
+        if trs:
+            transferencias.extend(trs)
 
     # Validación de completitud: si Ollama devolvió menos transferencias que
     # las que detectamos en el texto crudo, intentar recuperar las faltantes
@@ -290,28 +295,43 @@ def _process_one_store(
             log(f"ollama_{tienda.replace(' ', '_')}_completeness",
                 f"faltan {len(missing)} transfers: {missing}")
             for meta, bloque_texto in missing:
-                tr = _process_store_block(tienda, bloque_texto, transfer_meta=meta,
-                                          model=model, host=host, timeout=timeout,
-                                          max_retries=max_retries, log=log,
-                                          tag="retry_missing")
-                if tr:
-                    transferencias.append(tr)
+                trs = _process_store_block(
+                    tienda, bloque_texto, transfer_meta=meta,
+                    model=model, host=host, timeout=timeout,
+                    max_retries=max_retries, log=log,
+                    tag="retry_missing",
+                )
+                if trs:
+                    transferencias.extend(trs)
             # Ordenar por datetime para que el output sea estable
             transferencias.sort(key=lambda t: t.get("transfer_datetime", ""))
 
-    coerced: dict = {
-        "tienda": tienda,
-        "transferencias": transferencias,
-        "subtotal_tienda": None,
-    }
-    # Recalcular subtotal_tienda
+    return _wrap_store(tienda, transferencias)
+
+
+def _wrap_store(tienda: str, transferencias: list) -> dict:
+    """Construye el wrapper final de una tienda con subtotal_tienda validado.
+
+    El subtotal se recalcula SIEMPRE desde la suma de ``transfer_total`` de
+    las transferencias (Fix #3). Si el modelo también devolvió un
+    ``subtotal_tienda`` y difiere significativamente del recalculado, se
+    prefiere el recalculado y se marca con ``_subtotal_warning``.
+    """
+    # Recalcular desde la suma real
     s = 0.0
     for tr in transferencias:
         v = tr.get("transfer_total")
         if isinstance(v, (int, float)):
             s += float(v)
-    if s > 0:
-        coerced["subtotal_tienda"] = round(s, 2)
+    computed = round(s, 2) if s > 0 else None
+
+    # Si el modelo devolvió un subtotal absurdo (negativo grande, NaN-like),
+    # siempre gana el recalculado (Fix #3)
+    coerced: dict = {
+        "tienda": tienda,
+        "transferencias": transferencias,
+        "subtotal_tienda": computed,
+    }
     return coerced
 
 
@@ -445,13 +465,15 @@ def _process_store_block(
     max_retries: int,
     log,
     tag: str = "raw",
-) -> dict | None:
+) -> list | None:
     """Procesa UN bloque de texto (toda la tienda o un solo transfer).
 
     Si ``transfer_meta`` viene con id+datetime, los fija en el resultado
     (Ollama a veces omite transfer_datetime cuando el bloque es muy
-    pequeño). Devuelve el dict de transferencia, o ``None`` si Ollama
-    devolvió un array vacío / sin transfers.
+    pequeño). Devuelve la LISTA de transferencias del bloque (sin envolver
+    en ``{tienda, transferencias, subtotal_tienda}``; eso lo hace
+    ``_process_one_store`` al final). Devuelve ``None`` si Ollama devolvió
+    respuesta vacía o no parseable.
     """
     raw = chat_with_retry(
         build_store_prompt(tienda, bloque_texto),
@@ -477,34 +499,50 @@ def _process_store_block(
     coerced["tienda"] = tienda
 
     # Saneamiento: podar fantasmas, derivar transfer_date, marcar warnings
-    coerced["transferencias"] = _sanitize_transfers(
+    transferencias = _sanitize_transfers(
         coerced.get("transferencias") or [])
 
     # Punto 4: corrección defensiva de cost_unit
-    for tr in coerced["transferencias"]:
+    for tr in transferencias:
         for it in tr.get("items") or []:
             _infer_cost_unit(it)
 
     # Si transfer_meta viene, fijar id y datetime (el LLM chiquito a veces los omite)
     if transfer_meta:
-        for tr in coerced["transferencias"]:
+        for tr in transferencias:
             if not tr.get("transfer_id"):
                 tr["transfer_id"] = transfer_meta["transfer_id"]
             if not tr.get("transfer_datetime"):
                 tr["transfer_datetime"] = transfer_meta["transfer_datetime"]
 
-    # Punto 3: validar transfer_total vs Σ extension. Si no cuadra, reintentar
-    # SOLO este bloque (no la tienda entera).
-    for tr in coerced["transferencias"]:
+    # Fix #4: si transfer_total falta o es null, calcular desde sum(extension)
+    # y marcar con warning para auditoría.
+    for tr in transferencias:
+        total = tr.get("transfer_total")
+        items = tr.get("items") or []
+        items_sum = sum(
+            float(it.get("extension"))
+            for it in items
+            if isinstance(it, dict) and isinstance(it.get("extension"), (int, float))
+        )
+        if total is None and items_sum > 0:
+            tr["transfer_total"] = round(items_sum, 2)
+            tr["_transfer_total_inferred"] = "from_sum_of_extension"
+            log(f"ollama_{slug}_total_inferred_{tag}",
+                f"transfer {tr.get('transfer_datetime')}: "
+                f"total was None → inferred {tr['transfer_total']}")
+            continue
+        # Punto 3: validar transfer_total vs Σ extension. Si no cuadra,
+        # marcar warning (NO reintentar aquí — eso lo hace _process_one_store).
         if not _items_match_transfer_total(tr):
             tr["_validation_warning_total"] = "transfer_total != sum(extension)"
             log(f"ollama_{slug}_total_mismatch_{tag}",
                 f"transfer {tr.get('transfer_datetime')}: "
-                f"total={tr.get('transfer_total')} sum={sum((it.get('extension') or 0) for it in tr.get('items') or [])}")
+                f"total={tr.get('transfer_total')} sum={items_sum}")
 
     # Si el bloque devolvió 0 transfers y transfer_meta viene, crear uno mínimo
-    if not coerced["transferencias"] and transfer_meta:
-        coerced["transferencias"] = [{
+    if not transferencias and transfer_meta:
+        transferencias = [{
             "transfer_id": transfer_meta["transfer_id"],
             "transfer_datetime": transfer_meta["transfer_datetime"],
             "transfer_date": transfer_meta["transfer_datetime"][:10],
@@ -513,7 +551,7 @@ def _process_store_block(
             "_empty_response": True,
         }]
 
-    return coerced
+    return transferencias
 
 
 # ---------------------------------------------------------------------------

@@ -34,33 +34,155 @@ NOISE_PATTERNS = [
     # Numeración "1 de 4" (con espacios variables) y pegada
     re.compile(r"^\s*\d+\s+de\s+\d+\s*$", re.MULTILINE),
     re.compile(r"^\s*\d+de\d+\s*$", re.MULTILINE),
-    # Header repetido en una sola línea: "<CODIGO> Wen <NOMBRE>   45 -Transferencias"
-    re.compile(r"^\s*\d{2}\s+Wen\s+\S+\s+\d+\s*-\s*Transferencias\s*$",
-               re.MULTILINE | re.IGNORECASE),
-    # Componentes del header repetido
+    # Header de página partido en 1+ líneas por layout mode (Fix #2 / #5).
+    # En el PDF real se ve así (1 o 2 líneas, según el caso):
+    #   " 18 Wen Versalles                                         45 -Transferencias\n"
+    #   "                                                  Año Fiscal: 2026"
+    # o todo en una línea. A veces "Transferencias" se rompe como "Transferencia\ns".
+    # Solo nos importa que la línea contenga ambos marcadores (Wen + Año Fiscal)
+    # O que un bloque de líneas consecutivas los contenga.
+    re.compile(
+        r"^\s*\d{2}\s+Wen\s+\S+.*?\d+\s*-\s*Transferencias?"
+        r".*?"
+        r"(?:\n[^\n]*?)?"
+        r"Año\s+Fiscal:\s*\d{4}\s*$",
+        re.MULTILINE | re.IGNORECASE,
+    ),
+    # Variante multi-línea explícita (Fix #2 / #5) para los casos en que
+    # el header y "Año Fiscal" están en líneas separadas. Acepta que
+    # "Transferencias" se rompa como "Transferencia\ns".
+    re.compile(
+        r"^\s*\d{2}\s+Wen\s+\S+.*?\d+\s*-\s*Transferen[^\n]*\n"
+        r"(?:[^\n]*\n)*?"
+        r"Año\s+Fiscal:\s*\d{4}\s*$",
+        re.MULTILINE | re.IGNORECASE,
+    ),
+    # Componentes del header repetido (por si quedó algún sueltos)
     re.compile(r"^\s*Año\s+Fiscal:\s*\d{4}\s*$", re.MULTILINE | re.IGNORECASE),
     re.compile(r"^\s*Periodo:\s*\d+\s*$", re.MULTILINE | re.IGNORECASE),
     re.compile(r"^\s*\d{2}/\d{2}/\d{4}\s*-\s*\d{2}/\d{2}/\d{4}\s*$", re.MULTILINE),
-    # Encabezados de tabla repetidos (Description / Category / Quantity / Unit / Cost/Unit / Extension)
-    re.compile(r"^\s*Description\s+Category\s+Quantity.*$",
+    # Encabezados de tabla repetidos (Description / Category / Quantity / Unit / Cost/Unit / Extension).
+    # En layout mode la línea "Description  Category  Quantity Transferred  Unit Transferred  Cost/Unit  Extension"
+    # puede aparecer partida en 2-3 líneas. Aceptamos cualquier fragmento.
+    re.compile(r"^\s*Description\s+Category\s+Quantity.*?$",
                re.MULTILINE | re.IGNORECASE),
-    re.compile(r"^\s*Quantity\s+Transferred.*$", re.MULTILINE | re.IGNORECASE),
-    re.compile(r"^\s*Unit\s+Transferred.*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^\s*Quantity\s+Transferred.*?$",
+               re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^\s*Unit\s+Transferred.*?$",
+               re.MULTILINE | re.IGNORECASE),
     re.compile(r"^\s*Cost/Unit\s+Extension\s*$", re.MULTILINE | re.IGNORECASE),
+    # Encabezado partido: "Description" / "Category  Quantity Transferred" /
+    # "Unit Transferred  Cost/Unit  Extension" cada uno en su línea.
+    re.compile(r"^\s*Description\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^\s*Category\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^\s*Quantity\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^\s*Unit\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^\s*Cost/Unit\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^\s*Extension\s*$", re.MULTILINE | re.IGNORECASE),
     # Separadores explícitos
     re.compile(r"^\s*---\s*PAGE BREAK\s*---\s*$", re.MULTILINE),
 ]
+
+# Patrón multi-línea para el encabezado de tabla partido por layout mode.
+# El PDF NCR envuelve las palabras del header así (2-4 líneas):
+#     "Quantit"
+#     "y             Unit"
+#     "Description  Category  Transferr"
+#     "ed       Transferred  Cost/Unit  Extension"
+# Identificamos el bloque por la presencia de "Description" o "Quantit" en
+# alguna de las líneas, y descartamos todas las líneas conectadas hasta
+# encontrar "Extension" (con cierre) o una línea con un item real.
+_TABLE_HEADER_FRAGMENTS = re.compile(
+    r"^[ \t]*(?:"
+    r"Quantit|y|Unit|Description|Category|Transferr|ed|Transferred|Cost/Unit|Extension"
+    r")[ \t]*(?:[A-Za-z]+[ \t]+)*[A-Za-z]*[ \t]*$",
+    re.MULTILINE,
+)
+
+# Keywords que SOLO aparecen en el header (no en items reales)
+_HEADER_ONLY_WORDS = {
+    "description", "category", "quantity", "unit", "cost/unit", "extension",
+    "transferred", "quantit", "transferr",
+    # Fragmentos de word-wrap (letras sueltas resultado del corte del layout mode)
+    "y", "ed",
+    # "cost" separado de "Cost/Unit" cuando el slash se parte
+    "cost",
+}
 
 
 def clean_noise(text: str) -> str:
     """Elimina headers repetidos, footers, copyright y separadores."""
     for pat in NOISE_PATTERNS:
         text = pat.sub("", text)
+    # Eliminar encabezado de tabla partido por layout mode (Fix #2/#5).
+    text = _strip_table_header_fragments(text)
     # Colapsar 3+ saltos de línea a 1
     text = re.sub(r"\n{3,}", "\n\n", text)
     # Quitar espacios al final de cada línea
     text = "\n".join(line.rstrip() for line in text.split("\n"))
     return text.strip()
+
+
+def _strip_table_header_fragments(text: str) -> str:
+    """Elimina las líneas del encabezado de tabla que ``pypdf`` partió por
+    word-wrap (Fix #2/#5).
+
+    Una línea individual de este encabezado contiene SOLO palabras del set
+    ``_HEADER_ONLY_WORDS`` (posiblemente truncadas). Si una línea cumple
+    eso Y hay al menos otra línea cercana (saltando blancos) que también
+    parece fragmento del header, descartamos el bloque contiguo.
+
+    Para ser conservador: solo descartamos una línea si contiene palabras
+    exclusivas del header (no cualquier palabra). Esto evita falsos
+    positivos con items reales que tengan una sola palabra como
+    descripción (ej. "Bulto = 20 LB" o "Cookie").
+    """
+    if not text:
+        return text
+
+    def _is_header_line(s: str) -> bool:
+        words = set(re.findall(r"[A-Za-z]+", s.lower()))
+        return bool(words) and words.issubset(_HEADER_ONLY_WORDS)
+
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _is_header_line(line):
+            # Mirar si en las siguientes líneas (saltando blancos) hay
+            # al menos OTRO fragmento del header → bloque real a descartar.
+            j = i + 1
+            found_another = False
+            # Saltar blancos iniciales
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and _is_header_line(lines[j]):
+                found_another = True
+            if found_another:
+                # Descartar todo el bloque: desde i hasta la línea "real"
+                # posterior (o final). Las líneas reales se detectan por
+                # tener números, B/., o palabras fuera del header.
+                k = i
+                while k < len(lines):
+                    cur = lines[k]
+                    if not cur.strip():
+                        k += 1
+                        continue
+                    if _is_header_line(cur):
+                        k += 1
+                        continue
+                    # Línea no-header: si tiene números o B/., es contenido real
+                    if re.search(r"\d|B/\.", cur):
+                        break
+                    # Si es una línea con palabras no-header pero sin números
+                    # (poco probable), paramos también
+                    break
+                i = k
+                continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
 
 
 # Detecta el patrón de monto NCR: "B/.12.34" o "B/.1,036.70" (con coma de miles).
