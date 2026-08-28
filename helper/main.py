@@ -407,22 +407,38 @@ def _items_match_transfer_total(
 
 
 def _infer_cost_unit(item: dict) -> bool:
-    """Si ``cost_unit`` parece ser el número de empaque en vez del precio,
-    lo recalcula como ``extension / quantity`` y marca el item.
+    """Si ``cost_unit`` parece estar mal interpretado por el LLM, lo
+    recalcula y marca el item con un ``_validation_warning`` específico.
 
-    Heurísticas que disparan corrección (cualquiera):
-    1. ``cost_unit * quantity > extension * 2`` (costo_unitario bruto es
-       mucho mayor que la extensión real).
-    2. ``cost_unit < extension / quantity * 0.5`` y ``cost_unit`` es un
-       entero "redondo" sin decimales (señal típica de empaque:
-       ``cost=20`` cuando ext=35.45 y qty=1 → real price es 35.45).
+    Heurísticas (cualquiera dispara corrección):
 
-    NOTA: hay un caso límite ambiguo (``cost=20``, ``ext=35.45``, ``qty=1``)
-    donde 20 cae entre 0.5x y 1x del precio real. Corregirlo silenciosamente
-    podría romper items legítimos donde el precio sí es 20. Se deja sin
-    tocar a propósito; si se observa, agregar una tercera heurística que
-    cruce con ``unit_transferred`` (regex: si el número del empaque aparece
-    dentro de la cadena, es el bug).
+    1. ``cost_unit * quantity > extension * 2`` → ``cost_unit`` es el
+       número de empaque, no el precio. Recalcula como ``ext / qty``.
+       (Fix original, casos Metromall 1944/640/500.)
+
+    2. ``cost_unit`` es entero y ``< 0.5 * (ext / qty)`` → mismo bug que
+       (1) pero con precio "redondo" (ej. cost=20 cuando real=35.45).
+
+    3. ``ext / (qty * cost) > 5`` y el swap cost↔ext hace que la
+       multiplicación cuadre → el LLM invirtió las dos columnas.
+       Caso típico: PDF trae ``cost=11.68, ext=2.34`` y el LLM devuelve
+       ``cost=2.34, ext=11.68`` (Galleta Oreo, Brisas del Golf 07/13).
+
+    4. ``cost_unit < 1`` y ``unit_transferred`` contiene un entero N:
+       4a) ``qty == N`` → el LLM puso el tamaño de empaque como
+           cantidad. Recalcula: ``qty=1, cost=ext``. Caso típico:
+           Mozzarella Sticks (qty=384, cost=0.23, unit="CA=384 UN").
+       4b) ``qty = k * N`` con ``1 <= k <= 20`` → el LLM multiplicó la
+           cantidad real por el tamaño de empaque. Recalcula:
+           ``qty=k, cost=ext/k``. Caso típico: Nescafe Vasos 8oz
+           (qty=100, cost=0.11, unit="PQ= 50 UN", real qty=2).
+
+    Nota sobre (4): el umbral ``new_c > 5.0`` evita falsos positivos en
+    packs baratos (ej. PQ=10 UN a $1.00) donde el LLM podría haber
+    acertado. Si un pack legítimo cuesta entre $0.01 y $5.00 con
+    ``unit_transferred`` con tamaño de empaque, el item quedará con
+    ``_validation_warning: "qty*cost != extension"`` para revisión
+    manual.
 
     Devuelve True si se modificó el item.
     """
@@ -435,22 +451,80 @@ def _infer_cost_unit(item: dict) -> bool:
         return False
     if q == 0 or c == 0 or e == 0:
         return False
-    if c < 1:                  # precios < 1 son válidos (no tocar)
-        return False
 
-    # Heurística 1: cost_unit * qty >> extension (caso Metromall 1944, 640, 500)
-    if float(c) * float(q) > float(e) * 2.0:
-        item["cost_unit"] = round(float(e) / float(q), 4)
+    qf, cf, ef = float(q), float(c), float(e)
+
+    # Heurística 1: cost_unit * qty >> extension (caso empaque como precio)
+    if cf >= 1 and cf * qf > ef * 2.0:
+        item["cost_unit"] = round(ef / qf, 4)
         item["_validation_warning"] = "cost_unit_inferred"
         return True
 
-    # Heurística 2: cost_unit es entero y mucho menor que el precio real
-    if c == int(c):
-        real_unit = float(e) / float(q)
-        if real_unit > 0 and float(c) < real_unit * 0.5:
+    # Heurística 2: cost_unit entero, mucho menor que precio real
+    if cf >= 1 and c == int(c):
+        real_unit = ef / qf
+        if real_unit > 0 and cf < real_unit * 0.5:
             item["cost_unit"] = round(real_unit, 4)
             item["_validation_warning"] = "cost_unit_inferred"
             return True
+
+    # Heurística 3: cost_unit ↔ extension invertidos por el LLM
+    # Señal: ext / (qty * cost) > 5 (ext es ~5x mayor de lo esperado).
+    # Validación: si hacemos swap, ¿qty * new_cost ≈ new_ext?
+    if cf >= 1 and qf > 0 and (qf * cf) > 0 and ef / (qf * cf) > 5.0:
+        new_c = ef
+        new_e = cf
+        if abs(qf * new_c - new_e) < 0.05:
+            item["cost_unit"] = round(new_c, 4)
+            item["extension"] = round(new_e, 4)
+            item["_validation_warning"] = "cost_extension_swapped"
+            return True
+
+    # Heurística 4: quantity_transferred confundido con tamaño de empaque
+    if cf < 1 and cf > 0:
+        unit = item.get("unit_transferred")
+        if isinstance(unit, str) and unit:
+            for n_str in re.findall(r"\d+", unit):
+                n = int(n_str)
+                if n <= 1:
+                    continue
+                # 4a) qty == N → real qty=1, real cost=ext
+                if n == int(q):
+                    new_c = ef
+                    if new_c > 5.0:  # pack price mínimo para considerarlo real
+                        item["quantity_transferred"] = 1.0
+                        item["cost_unit"] = round(new_c, 4)
+                        item["_validation_warning"] = "qty_was_package_size"
+                        return True
+                # 4b) qty = k * N → real qty=k, real cost=ext/k
+                if int(q) > 0 and int(q) % n == 0:
+                    real_qty = int(q) // n
+                    if 1 <= real_qty <= 20:
+                        new_c = ef / real_qty
+                        if new_c > 5.0 and abs(real_qty * new_c - ef) < 0.05:
+                            item["quantity_transferred"] = float(real_qty)
+                            item["cost_unit"] = round(new_c, 4)
+                            item["_validation_warning"] = "qty_was_qty_times_package"
+                            return True
+
+    # Heurística 5: cost_unit correcto pero extension truncado
+    # Patron: cost_unit * qty >> extension (más de 5x) y el quotient
+    # redondeado a 1 decimal parece un entero de empaque "limpio".
+    # Caso 1961-Bag-5# Thank You: cost=0.03, qty=4, ext=0.3, real ext=3.0.
+    # Señal: (qty * cost) / ext = 12/0.3 = 40 (razón sospechosa).
+    if qf > 0 and ef > 0 and cf > 0 and qf * cf > ef * 5.0:
+        ratio = (qf * cf) / ef
+        if 5.0 <= ratio <= 1000.0:
+            # ratio casi entero sugiere que ext se dividió por un entero
+            r_round = round(ratio)
+            if r_round >= 2 and abs(ratio - r_round) < 0.1:
+                new_ext = round(ef * r_round, 4)
+                # Validar que tiene sentido: new_ext debe ser similar a qty*cost
+                if abs(new_ext - qf * cf) < 0.05:
+                    item["extension"] = new_ext
+                    item["_validation_warning"] = "extension_was_divided"
+                    return True
+
     return False
 
 
