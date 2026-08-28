@@ -12,10 +12,10 @@ La lógica vive en [`helper/`](helper/). La raíz del proyecto solo contiene
 
 - **Python 3.10+** con `venv` (módulo estándar).
 - **Ollama** corriendo en `http://localhost:11434`.
-- Modelo por defecto: `phi4-mini:latest`.
+- Modelo por defecto: `qwen2.5:7b`.
 
 ```bash
-ollama pull phi4-mini:latest
+ollama pull qwen2.5:7b
 ```
 
 ---
@@ -93,7 +93,7 @@ Flags principales:
 |-----------|------------------------------------------|----------------------------|
 | `--pdf`   | (requerido)                              | Ruta al PDF de transferencias |
 | `--out`   | `<proyecto>/output/transfers.json`       | Ruta del JSON de salida |
-| `--model` | `phi4-mini:latest`                       | Modelo de Ollama           |
+| `--model` | `qwen2.5:7b`                             | Modelo de Ollama           |
 | `--host`  | `http://localhost:11434`                 | URL del servidor Ollama    |
 
 Más detalle en [`helper/README.md`](helper/README.md).
@@ -128,6 +128,13 @@ docuclickai/
   no instalaste las dependencias. Repite los pasos 2.2 y 2.3.
 - **`OllamaError: ... connection refused`** — asegúrate de que Ollama esté
   corriendo (`ollama serve` o el servicio del sistema) y de haber descargado
-  el modelo (`ollama pull phi4-mini:latest`).
+  el modelo (`ollama pull qwen2.5:7b`).
+- **`totales.transfer_in_total` o `transfer_out_total` sale `0.00`** — ningún
+  `subtotal_tienda` quedó poblado. Revisa los artefactos en `tmp/session_*/`
+  (los `ollama_<tienda>_raw_*.json`) y el log del PDF extraído.
+- **JSON con `_validation_warning` o `_transfer_total_inferred`** — son
+  marcados de auditoría: el modelo tuvo inconsistencias pero el JSON es
+  utilizable. Detalle y campos afectados en
+  [helper/README.md → Marcadores de auditoría](helper/README.md#marcadores-de-auditoría).
 - **Quiero borrar caché de ejecuciones anteriores** —
   `rm -rf tmp/* output/*` (ambos directorios están en `.gitignore`).
