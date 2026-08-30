@@ -28,3 +28,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# PyInstaller (binario standalone)
+helper/build/
+helper/dist/
+helper/*.spec

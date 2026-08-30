@@ -777,6 +777,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="Host de Redis (default: env REDIS_HOST o 'localhost')")
     parser.add_argument("--redis-port", type=int, default=None,
                         help="Puerto de Redis (default: env REDIS_PORT o 6379)")
+    # --- pre-flight (Ollama + modelo). Solo el entry point lo usa; core_main
+    # los acepta silenciosamente si se pasan por CLI. ---
+    parser.add_argument("--auto-pull-model", action="store_true",
+                        help="Descargar el modelo automáticamente si falta (sin preguntar)")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Saltar chequeos de Ollama/modelo (útil para tests)")
     return parser.parse_args(argv)
 
 

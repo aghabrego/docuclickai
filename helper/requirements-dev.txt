@@ -1,0 +1,4 @@
+# Dependencias de desarrollo (no requeridas en runtime).
+# Instalar con: pip install -r helper/requirements-dev.txt
+
+pyinstaller>=6.0.0

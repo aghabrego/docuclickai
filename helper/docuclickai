@@ -9,6 +9,14 @@ Artefactos intermedios: ``<proyecto>/tmp/session_<ts>_<token>/``.
 
 Eventos Redis (canal ``pdf.processed`` y ``pdf.error``): se publican por
 cada tienda procesada y al final del PDF. Desactivar con ``--no-publish``.
+
+Pre-flight (solo en entry point, no en ``python -m main``):
+1. Detecta Ollama → exit 5 si no está (no se autoinstala).
+2. Detecta modelo → exit 6 si falta (pregunta o ``--auto-pull-model``).
+
+Exit codes:
+  0 OK | 1 error inesperado | 2 schema | 3 Ollama (procesamiento)
+  4 Redis | 5 Ollama (preflight) | 6 modelo (preflight)
 """
 from __future__ import annotations
 
@@ -22,6 +30,7 @@ from main import parse_args, main as core_main  # noqa: E402
 from tmp_manager import (  # noqa: E402
     lazy_cleanup, new_session_dir, session_id_from_path, write_artifact,
 )
+from preflight import PreflightError, run_preflight  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -39,13 +48,23 @@ def make_logger(session_dir):
 def main() -> int:
     args = parse_args(sys.argv[1:])
 
-    # Si NO es --no-publish, ping a Redis ANTES de crear sesión tmp ni
-    # tocar el PDF, para fail-hard limpio (exit 4 sin trabajo inútil).
-    # Usamos redis.Redis() directo (sin EventPublisher) porque el sid aún
-    # no existe en este punto.
+    # 1. PRE-FLIGHT: Ollama + modelo. Fail-fast ANTES de cualquier side-effect
+    # (no se crea sesión tmp ni se hace ping a Redis si Ollama no está).
+    try:
+        run_preflight(
+            model=args.model,
+            host=args.host,
+            auto_pull=args.auto_pull_model,
+            skip_ollama=args.skip_preflight,
+            skip_model=args.skip_preflight,
+        )
+    except PreflightError as exc:
+        print(f"Error preflight: {exc}", file=sys.stderr)
+        return exc.exit_code
+
+    # 2. Pre-check Redis (solo si no es --no-publish). Fail-hard limpio.
     if not args.no_publish:
         import redis as _redis  # noqa: PLC0415
-        from events import RedisPublishError  # noqa: PLC0415
         try:
             r = _redis.Redis(
                 host=args.redis_host or "localhost",
@@ -59,7 +78,7 @@ def main() -> int:
             print(f"Error Redis: {exc}", file=sys.stderr)
             return 4
 
-    # Limpieza tmp + sesión tras confirmar que Redis responde.
+    # 3. Limpieza tmp + sesión tras confirmar pre-flight + Redis.
     removed = lazy_cleanup(PROJECT_ROOT)
     if removed:
         print(f"[tmp] {removed} entrada(s) antiguas purgadas (>24h).", flush=True)
@@ -67,9 +86,8 @@ def main() -> int:
     sid = session_id_from_path(session)
     print(f"[tmp] sesión: {session.relative_to(PROJECT_ROOT)} (sid={sid})", flush=True)
 
-    # core_main parsea los args otra vez (idempotente), crea el publisher
-    # con el sid inyectado, y maneja exit codes 0/1/2/3/4 incluyendo la
-    # emisión de pdf.error. Inyectamos el logger para los artefactos tmp/.
+    # 4. core_main: parsea args (idempotente), crea el publisher con el sid,
+    # maneja exit codes 0/1/2/3/4 + emisión de pdf.error. Inyectamos log.
     return core_main(sys.argv[1:], log=make_logger(session), session_id=sid)
 
 
