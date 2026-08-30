@@ -7,7 +7,8 @@ Convenciones:
 - Fail-hard: si Redis no responde, se propaga ``RedisPublishError`` y el
   caller debe abortar el run (exit code 4).
 - Configurable vía env: ``REDIS_HOST`` (default ``localhost``),
-  ``REDIS_PORT`` (default ``6379``), ``REDIS_DB`` (default ``0``).
+  ``REDIS_PORT`` (default ``6379``), ``REDIS_DB`` (default ``0``),
+  ``REDIS_PASSWORD`` (default ``None``: sin auth).
 
 El publisher es perezoso: la conexión se abre en la primera publicación
 y se reutiliza (con ``socket_keepalive`` para detectar cortes).
@@ -53,6 +54,7 @@ class EventPublisher:
         host: str | None = None,
         port: int | None = None,
         db: int | None = None,
+        password: str | None = None,
         socket_timeout: float = 5.0,
     ) -> None:
         if redis is None:
@@ -66,6 +68,7 @@ class EventPublisher:
         self._host = host or os.environ.get("REDIS_HOST", "localhost")
         self._port = int(os.environ.get("REDIS_PORT", port or 6379))
         self._db = int(os.environ.get("REDIS_DB", db or 0))
+        self._password = os.environ.get("REDIS_PASSWORD", password)
         self._socket_timeout = socket_timeout
         self._client: redis.Redis | None = None
 
@@ -76,6 +79,7 @@ class EventPublisher:
             host=self._host,
             port=self._port,
             db=self._db,
+            password=self._password,
             socket_timeout=self._socket_timeout,
             socket_connect_timeout=self._socket_timeout,
             socket_keepalive=True,

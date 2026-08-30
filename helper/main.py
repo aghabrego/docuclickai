@@ -777,6 +777,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="Host de Redis (default: env REDIS_HOST o 'localhost')")
     parser.add_argument("--redis-port", type=int, default=None,
                         help="Puerto de Redis (default: env REDIS_PORT o 6379)")
+    parser.add_argument("--redis-db", type=int, default=None,
+                        help="DB numérica de Redis (default: env REDIS_DB o 0)")
+    parser.add_argument("--redis-password", default=None,
+                        help="Password de Redis (default: env REDIS_PASSWORD o sin auth)")
     # --- pre-flight (Ollama + modelo). Solo el entry point lo usa; core_main
     # los acepta silenciosamente si se pasan por CLI. ---
     parser.add_argument("--auto-pull-model", action="store_true",
@@ -810,6 +814,8 @@ def build_publisher(args: argparse.Namespace, *,
         session_id=session_id,
         host=args.redis_host,
         port=args.redis_port,
+        db=args.redis_db,
+        password=args.redis_password,
     )
     pub.ping()  # fail-hard si Redis no responde
     return pub

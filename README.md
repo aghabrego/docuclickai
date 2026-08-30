@@ -112,6 +112,8 @@ Artefactos intermedios: `./tmp/session_<ts>_<token>/`.
 | `--no-publish` | (off) | No publicar eventos en Redis (solo guarda JSON) |
 | `--redis-host` | `localhost` o env `REDIS_HOST` | Host de Redis |
 | `--redis-port` | `6379` o env `REDIS_PORT` | Puerto de Redis |
+| `--redis-db` | `0` o env `REDIS_DB` | DB numérica de Redis |
+| `--redis-password` | (sin auth) o env `REDIS_PASSWORD` | Password de Redis (si `requirepass` está activo) |
 
 ### Flags pre-flight (solo entry point)
 
