@@ -32,7 +32,30 @@ from tmp_manager import (  # noqa: E402
 )
 from preflight import PreflightError, run_preflight  # noqa: E402
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+def _resolve_project_root() -> Path:
+    """Raíz del proyecto donde van tmp/ y output/.
+
+    Estrategia (en orden):
+    1. ``$DOCUCLICKAI_HOME`` si está definida y existe.
+    2. CWD del usuario (donde se ejecutó el binario). Esto es lo correcto
+       para el binario empaquetado (PyInstaller): tmp/ queda al lado del
+       usuario, no dentro del bundle extraído a /tmp/.
+
+    Para ``./helper/docuclickai`` desde el repo, el CWD suele ser la raíz
+    del proyecto (que es lo que queremos). Para ``python main.py``, igual.
+    """
+    env = os.environ.get("DOCUCLICKAI_HOME")
+    if env:
+        p = Path(env).expanduser().resolve()
+        if p.is_dir():
+            return p
+    return Path.cwd().resolve()
+
+
+import os  # noqa: E402
+
+PROJECT_ROOT = _resolve_project_root()
 
 
 def make_logger(session_dir):
