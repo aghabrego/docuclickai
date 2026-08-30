@@ -20,6 +20,7 @@ from ollama_client import (
     parse_json, OllamaError, is_truncated_json,
 )
 from pdf_extractor import extract_text, parse_header, split_sections, split_stores
+from events import EventPublisher, RedisPublishError
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +642,12 @@ def run(
     timeout: int = DEFAULT_TIMEOUT,
     max_retries: int = 2,
     log=None,  # callable opcional para artefactos en tmp/
+    publisher: EventPublisher | None = None,
 ) -> dict:
     log = log or (lambda *_a, **_k: None)
+
+    pdf_name = Path(pdf_path).name
+    pub = publisher  # puede ser None → no se publica nada
 
     print(f"[1/4] Extrayendo texto de {pdf_path}...", flush=True)
     full_text = extract_text(pdf_path)
@@ -659,21 +664,44 @@ def run(
     in_list = []
     for s in stores_in:
         print(f"   · {s['tienda']}", flush=True)
-        in_list.append(_process_one_store(
+        store = _process_one_store(
             s["tienda"], s["texto"],
             model=model, host=host, timeout=timeout, max_retries=max_retries,
             log=log,
-        ))
+        )
+        in_list.append(store)
+        # Emitir evento por tienda en cuanto Ollama termina con ella
+        if pub is not None:
+            n = pub.publish_store(
+                archivo=pdf_name,
+                origen=header_meta["origen"],
+                anio_fiscal=header_meta["anio_fiscal"],
+                periodo=header_meta["periodo"],
+                tipo="transfer_in",
+                store_data=store,
+            )
+            print(f"      → pdf.processed (transfer_in) emitido a {n} suscriptor(es)", flush=True)
 
     print(f"[3/4] Procesando {len(stores_out)} tiendas Transfer Out con Ollama ({model})...", flush=True)
     out_list = []
     for s in stores_out:
         print(f"   · {s['tienda']}", flush=True)
-        out_list.append(_process_one_store(
+        store = _process_one_store(
             s["tienda"], s["texto"],
             model=model, host=host, timeout=timeout, max_retries=max_retries,
             log=log,
-        ))
+        )
+        out_list.append(store)
+        if pub is not None:
+            n = pub.publish_store(
+                archivo=pdf_name,
+                origen=header_meta["origen"],
+                anio_fiscal=header_meta["anio_fiscal"],
+                periodo=header_meta["periodo"],
+                tipo="transfer_out",
+                store_data=store,
+            )
+            print(f"      → pdf.processed (transfer_out) emitido a {n} suscriptor(es)", flush=True)
 
     print("[4/4] Componiendo y validando JSON final...", flush=True)
     data = {
@@ -694,6 +722,22 @@ def run(
     out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     n_in = sum(len(t["transferencias"]) for t in in_list if isinstance(t, dict))
     n_out = sum(len(t["transferencias"]) for t in out_list if isinstance(t, dict))
+
+    # Evento resumen al terminar el PDF completo
+    if pub is not None:
+        pub.publish_summary(
+            archivo=pdf_name,
+            origen=header_meta["origen"],
+            anio_fiscal=header_meta["anio_fiscal"],
+            periodo=header_meta["periodo"],
+            totales=data["totales"],
+            tiendas_in=len(in_list),
+            tiendas_out=len(out_list),
+            transferencias_in=n_in,
+            transferencias_out=n_out,
+        )
+        print(f"      → pdf.processed.summary emitido", flush=True)
+
     print(f"Listo. IN: {len(in_list)} tiendas / {n_in} transferencias · "
           f"OUT: {len(out_list)} tiendas / {n_out} transferencias -> {out_path}")
     return data
@@ -726,6 +770,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Host Ollama (default: {DEFAULT_HOST})")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Timeout por sección en segundos (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("--max-retries", type=int, default=2, help="Reintentos si el JSON viene truncado (default: 2)")
+    # --- eventos Redis ---
+    parser.add_argument("--no-publish", action="store_true",
+                        help="No publicar eventos en Redis (solo guarda el JSON)")
+    parser.add_argument("--redis-host", default=None,
+                        help="Host de Redis (default: env REDIS_HOST o 'localhost')")
+    parser.add_argument("--redis-port", type=int, default=None,
+                        help="Puerto de Redis (default: env REDIS_PORT o 6379)")
     return parser.parse_args(argv)
 
 
@@ -734,22 +785,94 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 DEFAULT_OUT = Path(__file__).resolve().parent.parent / "output" / "transfers.json"
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_publisher(args: argparse.Namespace, *,
+                    session_id: str | None) -> EventPublisher | None:
+    """Construye el publisher desde los flags. Devuelve None si --no-publish
+    o si no se proporcionó un session_id válido.
+
+    Hace ping explícito: si Redis no responde al construir el publisher,
+    propagamos ``RedisPublishError`` (fail-hard). El caller debe abortar
+    con exit 4 antes de tocar el PDF / Ollama.
+
+    ``session_id`` se inyecta en cada evento para que el consumidor pueda
+    correlacionar todos los mensajes de un mismo run. Si falta o es vacío,
+    no se puede publicar (cada evento requiere sid) y devolvemos None.
+    """
+    if args.no_publish or not session_id:
+        return None
+    pub = EventPublisher(
+        session_id=session_id,
+        host=args.redis_host,
+        port=args.redis_port,
+    )
+    pub.ping()  # fail-hard si Redis no responde
+    return pub
+
+
+def _emit_error(publisher: EventPublisher | None, archivo: str,
+                error: str, contexto: str) -> None:
+    """Best-effort: si el publisher falla al emitir el error, no propagamos
+    (ya estamos en un flujo de error y no queremos enmascarar el original)."""
+    if publisher is None:
+        return
+    try:
+        publisher.publish_error(
+            archivo=archivo, error=error, contexto=contexto,
+        )
+    except RedisPublishError:
+        pass
+
+
+def main(argv: list[str] | None = None, *,
+         log=None, session_id: str | None = None) -> int:
+    """Entry point principal.
+
+    ``log`` es un callable opcional para artefactos tmp/ (entry point lo
+    inyecta; ``python -m main`` lo deja en None → no se escriben artefactos).
+
+    ``session_id`` es el identificador único de la sesión (sid). El entry
+    point lo extrae del directorio de sesión tmp/ y lo inyecta en cada
+    evento publicado. Si se omite, los eventos NO se publican (publisher
+    queda en None) para que ``python -m main`` funcione sin tocar Redis.
+    """
     args = parse_args(sys.argv[1:] if argv is None else argv)
     out_path = args.out if args.out is not None else DEFAULT_OUT
+    archivo = Path(args.pdf).name
+
+    try:
+        publisher = build_publisher(args, session_id=session_id)
+    except RedisPublishError as exc:
+        print(f"Error Redis: {exc}", file=sys.stderr)
+        return 4
+
     try:
         run(args.pdf, out_path, model=args.model, host=args.host,
-            timeout=args.timeout, max_retries=args.max_retries)
+            timeout=args.timeout, max_retries=max_retries_safe(args),
+            log=log, publisher=publisher)
     except SchemaError as exc:
         print(f"Error de esquema: {exc}", file=sys.stderr)
+        _emit_error(publisher, archivo, str(exc), "schema_error")
         return 2
     except OllamaError as exc:
         print(f"Error Ollama: {exc}", file=sys.stderr)
+        _emit_error(publisher, archivo, str(exc), "ollama_error")
         return 3
+    except RedisPublishError as exc:
+        print(f"Error Redis: {exc}", file=sys.stderr)
+        return 4
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)
+        _emit_error(publisher, archivo, str(exc), "unexpected")
         return 1
+    finally:
+        if publisher is not None:
+            publisher.close()
     return 0
+
+
+def max_retries_safe(args: argparse.Namespace) -> int:
+    """Pequeño helper para mantener ``main`` corto y testeable."""
+    return int(args.max_retries)
 
 
 if __name__ == "__main__":

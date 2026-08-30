@@ -47,12 +47,23 @@ def lazy_cleanup(project_root: Path, *, now: datetime | None = None) -> int:
 
 
 def new_session_dir(project_root: Path) -> Path:
-    """Crea y devuelve ``tmp/session_<timestamp>_<token>/``."""
+    """Crea y devuelve ``tmp/session_<timestamp>_<token>/``.
+
+    El identificador de sesión (sid) es el nombre del directorio:
+    ``session_<timestamp>_<token>``. Útil para correlacionar artefactos y
+    eventos que pertenecen al mismo run.
+    """
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     token = secrets.token_hex(6)  # 12 chars
-    path = tmp_root(project_root) / f"{SESSION_PREFIX}{ts}_{token}"
+    sid = f"{SESSION_PREFIX}{ts}_{token}"
+    path = tmp_root(project_root) / sid
     path.mkdir(parents=True, exist_ok=False)
     return path
+
+
+def session_id_from_path(session_dir: Path) -> str:
+    """Extrae el sid (nombre del directorio) de un path de sesión."""
+    return Path(session_dir).name
 
 
 def long_name(prefix: str, *, suffix: str = "") -> str:
