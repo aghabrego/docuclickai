@@ -14,10 +14,19 @@ Reglas de ruteo (en orden):
 """
 from __future__ import annotations
 
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
+
+# Auto-cargar .env al importarse (idempotente, silencioso si no existe).
+# Se hace ANTES de leer cualquier env var abajo.
+try:
+    from dotenv_loader import load_dotenv as _load_dotenv
+    _load_dotenv()
+except Exception:  # noqa: BLE001
+    pass
 
 from ollama_client import (
     DEFAULT_HOST as DEFAULT_OLLAMA_HOST,
@@ -105,13 +114,18 @@ def resolve_backend(
     openai_base_url = (openai_base_url or DEFAULT_OPENAI_BASE_URL).rstrip("/")
     effective_model = model or DEFAULT_OLLAMA_MODEL
 
+    # Para OpenAI: si no se pasó key por flag, leer del entorno (que ya
+    # incluye lo que dotenv_loader cargo desde .env). Asi ``describe()``
+    # reporta el valor real y no "<missing>".
+    effective_openai_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
+
     # Regla 1: prefijo explícito OpenAI
     if _looks_like_openai_model(effective_model):
         return LLMConfig(
             backend="openai",
             model=effective_model,
             host=openai_base_url,
-            api_key=openai_api_key,
+            api_key=effective_openai_key,
         )
 
     # Regla 2: tag estilo Ollama
@@ -130,12 +144,12 @@ def resolve_backend(
             model=effective_model,
             host=ollama_host,
         )
-    if openai_api_key:
+    if effective_openai_key:
         return LLMConfig(
             backend="openai",
             model=effective_model,
             host=openai_base_url,
-            api_key=openai_api_key,
+            api_key=effective_openai_key,
         )
 
     raise LLMBackendError(
