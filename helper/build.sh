@@ -24,10 +24,13 @@ pyinstaller \
     --noconfirm \
     --paths . \
     --hidden-import ollama_client \
+    --hidden-import openai_client \
+    --hidden-import llm_client \
     --hidden-import pdf_extractor \
     --hidden-import events \
     --hidden-import tmp_manager \
     --hidden-import preflight \
+    --hidden-import dotenv_loader \
     docuclickai
 
 BIN=dist/docuclickai
