@@ -54,6 +54,9 @@ docker run --rm \
         --hidden-import events \
         --hidden-import tmp_manager \
         --hidden-import preflight \
+        --hidden-import openai_client \
+        --hidden-import llm_client \
+        --hidden-import dotenv_loader \
         --distpath /src/dist \
         --workpath /src/build \
         --specpath /src \
