@@ -15,8 +15,9 @@ Pre-flight (solo en entry point, no en ``python -m main``):
 2. Detecta modelo → exit 6 si falta (pregunta o ``--auto-pull-model``).
 
 Exit codes:
-  0 OK | 1 error inesperado | 2 schema | 3 Ollama (procesamiento)
-  4 Redis | 5 Ollama (preflight) | 6 modelo (preflight)
+  0 OK | 1 error inesperado | 2 schema | 3 LLM (Ollama u OpenAI, procesamiento)
+  4 Redis | 5 Ollama (preflight) | 6 modelo Ollama (preflight)
+  7 OpenAI/API key (preflight)
 """
 from __future__ import annotations
 
@@ -80,6 +81,8 @@ def main() -> int:
             auto_pull=args.auto_pull_model,
             skip_ollama=args.skip_preflight,
             skip_model=args.skip_preflight,
+            openai_base_url=args.openai_base_url,
+            openai_api_key=args.openai_api_key,
         )
     except PreflightError as exc:
         print(f"Error preflight: {exc}", file=sys.stderr)

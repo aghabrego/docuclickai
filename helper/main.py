@@ -16,11 +16,27 @@ import sys
 from pathlib import Path
 
 from ollama_client import (
-    DEFAULT_MODEL, DEFAULT_HOST, DEFAULT_TIMEOUT, chat_with_retry,
-    parse_json, OllamaError, is_truncated_json,
+    DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL,
+    DEFAULT_HOST as DEFAULT_OLLAMA_HOST,
+    DEFAULT_TIMEOUT, OllamaError,
 )
+from llm_client import (
+    LLMConfig, LLMBackendError, chat_with_retry,
+    is_truncated_json, parse_json, resolve_backend,
+)
+from openai_client import OpenAIError as _OpenAIError  # noqa: F401  re-exportado para handlers
 from pdf_extractor import extract_text, parse_header, split_sections, split_stores
 from events import EventPublisher, RedisPublishError
+
+
+# Alias para no romper código existente que importaba DEFAULT_MODEL/HOST
+# apuntando a Ollama. Si se quiere OpenAI se usa ``resolve_backend``.
+DEFAULT_MODEL = DEFAULT_OLLAMA_MODEL
+DEFAULT_HOST = DEFAULT_OLLAMA_HOST
+
+
+class LLMError(RuntimeError):
+    """Error genérico al llamar al backend LLM (Ollama u OpenAI)."""
 
 
 # ---------------------------------------------------------------------------
@@ -254,16 +270,16 @@ def _process_one_store(
     tienda: str,
     store_text: str,
     *,
-    model: str,
-    host: str,
+    llm_config: LLMConfig,
     timeout: int,
     max_retries: int,
     log,
 ) -> dict:
-    """Llama a Ollama para una sola tienda y devuelve el dict normalizado.
+    """Llama al LLM (Ollama u OpenAI) para una sola tienda y devuelve el
+    dict normalizado.
 
     Estrategia de sub-batches: si el texto tiene 2+ líneas ``Transfer:``,
-    subdivide el texto por transferencia y llama a Ollama una vez por
+    subdivide el texto por transferencia y llama al LLM una vez por
     bloque. Esto le da al LLM chunks pequeños y uniformes, lo que reduce
     el riesgo de que omita o fusione transacciones grandes.
     """
@@ -272,7 +288,7 @@ def _process_one_store(
         # Fallback al comportamiento de bloque único (texto sin marcadores Transfer)
         transferencias = _process_store_block(
             tienda, store_text, transfer_meta=None,
-            model=model, host=host, timeout=timeout,
+            llm_config=llm_config, timeout=timeout,
             max_retries=max_retries, log=log,
         ) or []
         return _wrap_store(tienda, transferencias)
@@ -281,24 +297,25 @@ def _process_one_store(
     for meta, bloque_texto in bloques:
         trs = _process_store_block(
             tienda, bloque_texto, transfer_meta=meta,
-            model=model, host=host, timeout=timeout,
+            llm_config=llm_config, timeout=timeout,
             max_retries=max_retries, log=log,
         )
         if trs:
             transferencias.extend(trs)
 
-    # Validación de completitud: si Ollama devolvió menos transferencias que
-    # las que detectamos en el texto crudo, intentar recuperar las faltantes
-    # con reintento individual.
+    # Validación de completitud: si el LLM devolvió menos transferencias
+    # que las que detectamos en el texto crudo, intentar recuperar las
+    # faltantes con reintento individual.
     if len(transferencias) < len(bloques):
         missing = _find_missing_transfers(bloques, transferencias)
         if missing:
-            log(f"ollama_{tienda.replace(' ', '_')}_completeness",
+            slug = tienda.replace(' ', '_')
+            log(f"llm_{slug}_completeness",
                 f"faltan {len(missing)} transfers: {missing}")
             for meta, bloque_texto in missing:
                 trs = _process_store_block(
                     tienda, bloque_texto, transfer_meta=meta,
-                    model=model, host=host, timeout=timeout,
+                    llm_config=llm_config, timeout=timeout,
                     max_retries=max_retries, log=log,
                     tag="retry_missing",
                 )
@@ -534,8 +551,7 @@ def _process_store_block(
     bloque_texto: str,
     *,
     transfer_meta: dict | None,
-    model: str,
-    host: str,
+    llm_config: LLMConfig,
     timeout: int,
     max_retries: int,
     log,
@@ -544,23 +560,24 @@ def _process_store_block(
     """Procesa UN bloque de texto (toda la tienda o un solo transfer).
 
     Si ``transfer_meta`` viene con id+datetime, los fija en el resultado
-    (Ollama a veces omite transfer_datetime cuando el bloque es muy
+    (el LLM a veces omite transfer_datetime cuando el bloque es muy
     pequeño). Devuelve la LISTA de transferencias del bloque (sin envolver
     en ``{tienda, transferencias, subtotal_tienda}``; eso lo hace
-    ``_process_one_store`` al final). Devuelve ``None`` si Ollama devolvió
+    ``_process_one_store`` al final). Devuelve ``None`` si el LLM devolvió
     respuesta vacía o no parseable.
     """
     raw = chat_with_retry(
         build_store_prompt(tienda, bloque_texto),
-        model=model, host=host, timeout=timeout, max_retries=max_retries,
+        config=llm_config, timeout=timeout, max_retries=max_retries,
     )
     slug = tienda.replace(' ', '_')
+    prefix = "openai" if llm_config.backend == "openai" else "ollama"
     if tag == "raw":
-        log(f"ollama_{slug}_raw", raw)
+        log(f"{prefix}_{slug}_raw", raw)
     else:
-        log(f"ollama_{slug}_{tag}", raw)
+        log(f"{prefix}_{slug}_{tag}", raw)
     if is_truncated_json(raw):
-        log(f"ollama_{slug}_truncated_flag_{tag}", "TRUNCATED")
+        log(f"{prefix}_{slug}_truncated_flag_{tag}", "TRUNCATED")
         if tag != "raw":
             # En reintento de completitud, no elevar: aceptar vacío
             return None
@@ -568,7 +585,7 @@ def _process_store_block(
     try:
         parsed = parse_json(raw)
     except Exception:  # noqa: BLE001
-        log(f"ollama_{slug}_parse_error_{tag}", "PARSE_ERROR")
+        log(f"{prefix}_{slug}_parse_error_{tag}", "PARSE_ERROR")
         return None
     coerced = _coerce_store_response(parsed)
     coerced["tienda"] = tienda
@@ -603,7 +620,7 @@ def _process_store_block(
         if total is None and items_sum > 0:
             tr["transfer_total"] = round(items_sum, 2)
             tr["_transfer_total_inferred"] = "from_sum_of_extension"
-            log(f"ollama_{slug}_total_inferred_{tag}",
+            log(f"{prefix}_{slug}_total_inferred_{tag}",
                 f"transfer {tr.get('transfer_datetime')}: "
                 f"total was None → inferred {tr['transfer_total']}")
             continue
@@ -611,7 +628,7 @@ def _process_store_block(
         # marcar warning (NO reintentar aquí — eso lo hace _process_one_store).
         if not _items_match_transfer_total(tr):
             tr["_validation_warning_total"] = "transfer_total != sum(extension)"
-            log(f"ollama_{slug}_total_mismatch_{tag}",
+            log(f"{prefix}_{slug}_total_mismatch_{tag}",
                 f"transfer {tr.get('transfer_datetime')}: "
                 f"total={tr.get('transfer_total')} sum={items_sum}")
 
@@ -643,11 +660,24 @@ def run(
     max_retries: int = 2,
     log=None,  # callable opcional para artefactos en tmp/
     publisher: EventPublisher | None = None,
+    openai_api_key: str | None = None,
+    openai_base_url: str | None = None,
 ) -> dict:
     log = log or (lambda *_a, **_k: None)
 
     pdf_name = Path(pdf_path).name
     pub = publisher  # puede ser None → no se publica nada
+
+    # Resolver backend ANTES de empezar (fail-fast si ni Ollama ni OpenAI
+    # están disponibles, o si el modelo es de OpenAI y falta la API key).
+    llm_config = resolve_backend(
+        model=model,
+        ollama_host=host,
+        openai_base_url=openai_base_url,
+        openai_api_key=openai_api_key,
+    )
+    backend_label = "OpenAI" if llm_config.backend == "openai" else "Ollama"
+    print(f"[llm] backend: {llm_config.describe()}", flush=True)
 
     print(f"[1/4] Extrayendo texto de {pdf_path}...", flush=True)
     full_text = extract_text(pdf_path)
@@ -660,17 +690,17 @@ def run(
     log("pdf_transfer_in", sections["transfer_in"])
     log("pdf_transfer_out", sections["transfer_out"])
 
-    print(f"[2/4] Procesando {len(stores_in)} tiendas Transfer In con Ollama ({model})...", flush=True)
+    print(f"[2/4] Procesando {len(stores_in)} tiendas Transfer In con {backend_label} ({llm_config.model})...", flush=True)
     in_list = []
     for s in stores_in:
         print(f"   · {s['tienda']}", flush=True)
         store = _process_one_store(
             s["tienda"], s["texto"],
-            model=model, host=host, timeout=timeout, max_retries=max_retries,
+            llm_config=llm_config, timeout=timeout, max_retries=max_retries,
             log=log,
         )
         in_list.append(store)
-        # Emitir evento por tienda en cuanto Ollama termina con ella
+        # Emitir evento por tienda en cuanto el LLM termina con ella
         if pub is not None:
             n = pub.publish_store(
                 archivo=pdf_name,
@@ -682,13 +712,13 @@ def run(
             )
             print(f"      → pdf.processed (transfer_in) emitido a {n} suscriptor(es)", flush=True)
 
-    print(f"[3/4] Procesando {len(stores_out)} tiendas Transfer Out con Ollama ({model})...", flush=True)
+    print(f"[3/4] Procesando {len(stores_out)} tiendas Transfer Out con {backend_label} ({llm_config.model})...", flush=True)
     out_list = []
     for s in stores_out:
         print(f"   · {s['tienda']}", flush=True)
         store = _process_one_store(
             s["tienda"], s["texto"],
-            model=model, host=host, timeout=timeout, max_retries=max_retries,
+            llm_config=llm_config, timeout=timeout, max_retries=max_retries,
             log=log,
         )
         out_list.append(store)
@@ -763,13 +793,28 @@ def _sum_totals(stores: list) -> float:
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DocuClickAI helper (Ollama).")
+    parser = argparse.ArgumentParser(
+        description=(
+            "DocuClickAI helper. Backend por defecto: Ollama. "
+            "Para usar OpenAI (gpt-4o-mini, etc.) pasa --model gpt-4o-mini "
+            "y --openai-api-key."
+        )
+    )
     parser.add_argument("--pdf", required=True, type=Path, help="Ruta al PDF de transferencias")
     parser.add_argument("--out", type=Path, default=None, help=f"Ruta del JSON de salida (default: {DEFAULT_OUT})")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Modelo Ollama (default: {DEFAULT_MODEL})")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=(
+        f"Modelo LLM (default: {DEFAULT_MODEL}). Si empieza con 'gpt-', 'o1-', etc. "
+        "se enruta a OpenAI; si tiene formato 'nombre:tag' va a Ollama."
+    ))
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Host Ollama (default: {DEFAULT_HOST})")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Timeout por sección en segundos (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("--max-retries", type=int, default=2, help="Reintentos si el JSON viene truncado (default: 2)")
+    # --- OpenAI (opcional). Solo se usan si el modelo es de la familia OpenAI. ---
+    parser.add_argument("--openai-api-key", default=None,
+        help="API key de OpenAI (default: env OPENAI_API_KEY). Solo aplica a modelos 'gpt-*'.")
+    parser.add_argument("--openai-base-url", default=None,
+        help=f"Base URL compatible con la API de OpenAI (default: https://api.openai.com/v1). "
+             "Útil para Azure OpenAI, OpenRouter, o un proxy local.")
     # --- eventos Redis ---
     parser.add_argument("--no-publish", action="store_true",
                         help="No publicar eventos en Redis (solo guarda el JSON)")
@@ -860,14 +905,23 @@ def main(argv: list[str] | None = None, *,
     try:
         run(args.pdf, out_path, model=args.model, host=args.host,
             timeout=args.timeout, max_retries=max_retries_safe(args),
-            log=log, publisher=publisher)
+            log=log, publisher=publisher,
+            openai_api_key=args.openai_api_key,
+            openai_base_url=args.openai_base_url)
     except SchemaError as exc:
         print(f"Error de esquema: {exc}", file=sys.stderr)
         _emit_error(publisher, archivo, str(exc), "schema_error")
         return 2
-    except OllamaError as exc:
-        print(f"Error Ollama: {exc}", file=sys.stderr)
-        _emit_error(publisher, archivo, str(exc), "ollama_error")
+    except (OllamaError, _OpenAIError) as exc:
+        # Cualquier error de backend LLM (Ollama o OpenAI) sale como exit 3
+        # con un mensaje claro sobre cuál fue.
+        backend = "OpenAI" if isinstance(exc, _OpenAIError) else "Ollama"
+        print(f"Error {backend}: {exc}", file=sys.stderr)
+        _emit_error(publisher, archivo, str(exc), f"{backend.lower()}_error")
+        return 3
+    except LLMBackendError as exc:
+        print(f"Error de backend: {exc}", file=sys.stderr)
+        _emit_error(publisher, archivo, str(exc), "llm_backend_error")
         return 3
     except RedisPublishError as exc:
         print(f"Error Redis: {exc}", file=sys.stderr)

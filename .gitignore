@@ -33,3 +33,8 @@ Thumbs.db
 helper/build/
 helper/dist/
 helper/*.spec
+
+# Secrets / local config (NO commitear)
+.env
+.env.local
+*.local

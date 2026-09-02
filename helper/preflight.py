@@ -1,14 +1,19 @@
 """Pre-flight checks para el binario empaquetado (o ejecutable en general).
 
-Dos chequeos, ambos fail-fast con exit codes propios:
+Dos familias de chequeos, ambos fail-fast con exit codes propios:
 
-1. ``check_ollama()`` → exit 5 si Ollama no responde.
-   NO instala Ollama automáticamente. Solo imprime instrucciones.
+* **Ollama** (``check_ollama()`` / ``check_model()``):
+  - ``check_ollama()`` → exit 5 si Ollama no responde.
+    NO instala Ollama automáticamente. Solo imprime instrucciones.
+  - ``check_model()`` → exit 6 si el modelo no está disponible.
+    Si TTY y no se pasa ``auto_pull``, pregunta al usuario. Si se pasa
+    ``auto_pull=True`` o stdin no es TTY, ejecuta ``ollama pull`` sin
+    preguntar.
 
-2. ``check_model()`` → exit 6 si el modelo no está disponible.
-   Si TTY y no se pasa ``auto_pull``, pregunta al usuario. Si se pasa
-   ``auto_pull=True`` o stdin no es TTY, ejecuta ``ollama pull`` sin
-   preguntar.
+* **OpenAI-compatible** (``check_openai()``):
+  - ``check_openai()`` → exit 7 si la API key falta, es inválida, o el
+    modelo no está visible. NO descarga nada; solo valida contra
+    ``/v1/models``.
 
 El objetivo es que el binario pueda copiarse a otro server y funcionar
 sin sorpresas invasivas (no ``sudo``, no instalaciones silenciosas).
@@ -16,12 +21,21 @@ sin sorpresas invasivas (no ``sudo``, no instalaciones silenciosas).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from typing import Sequence
+
+# Auto-cargar .env al importarse (idempotente). Igual que en
+# openai_client: nunca debe romper el import si dotenv_loader falta.
+try:
+    from dotenv_loader import load_dotenv as _load_dotenv
+    _load_dotenv()
+except Exception:  # noqa: BLE001
+    pass
 
 # Reusar DEFAULT_MODEL/DEFAULT_HOST del cliente Ollama para evitar drift
 # si el default cambia.
@@ -31,8 +45,26 @@ except ImportError:  # pragma: no cover - binario standalone sin path
     DEFAULT_MODEL = "qwen2.5:7b"
     DEFAULT_HOST = "http://localhost:11434"
 
+try:
+    from openai_client import (
+        DEFAULT_BASE_URL as DEFAULT_OPENAI_BASE_URL,
+        DEFAULT_MODEL as DEFAULT_OPENAI_MODEL,
+        OpenAIError,
+        list_models as openai_list_models,
+    )
+    from llm_client import _looks_like_openai_model  # type: ignore
+except ImportError:  # pragma: no cover - binario standalone sin path
+    DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+    DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+    OpenAIError = RuntimeError  # type: ignore
+    def _looks_like_openai_model(_m: str) -> bool:  # type: ignore
+        return False
+    def openai_list_models(*_a, **_k):  # type: ignore
+        raise RuntimeError("openai_client no disponible")
+
 PREFETCH_TIMEOUT = 5.0     # s — ping a /api/tags
 PULL_TIMEOUT = 1800.0      # s — 30 min; modelos grandes bajan lentos
+OPENAI_CHECK_TIMEOUT = 5.0 # s — ping a /v1/models
 
 
 class PreflightError(RuntimeError):
@@ -185,13 +217,78 @@ def check_model(model: str = DEFAULT_MODEL,
         )
 
 
+def check_openai(
+    model: str = DEFAULT_OPENAI_MODEL,
+    base_url: str = DEFAULT_OPENAI_BASE_URL,
+    api_key: str | None = None,
+) -> None:
+    """Verifica que la API key es válida y el modelo está disponible.
+
+    Lanza ``PreflightError(exit 7)`` si:
+
+    - No hay API key (ni en flag ni en ``$OPENAI_API_KEY``).
+    - La key es inválida o el endpoint no responde.
+    - El modelo pedido no aparece en ``/v1/models``.
+
+    No descarga nada. Solo valida credenciales y catálogo.
+    """
+    key = api_key or os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise PreflightError(
+            "Falta API key de OpenAI.\n"
+            "Pásala con --openai-api-key o exporta OPENAI_API_KEY=sk-... ",
+            exit_code=7,
+        )
+    try:
+        available = openai_list_models(
+            base_url=base_url, api_key=key, timeout=OPENAI_CHECK_TIMEOUT,
+        )
+    except (OpenAIError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PreflightError(
+            f"No se pudo conectar a {base_url}/v1/models.\n"
+            f"Detalle: {exc}",
+            exit_code=7,
+        ) from exc
+
+    if not available:
+        # La key respondió pero el catálogo está vacío (raro pero posible
+        # en deployments con scopes limitados). No fallamos por esto: el
+        # modelo podría existir y aun así no listarse.
+        return
+    if model not in available and model.split(":")[0] not in available:
+        # Sugerimos los primeros 5 modelos visibles para ayudar al usuario.
+        sample = ", ".join(available[:5])
+        raise PreflightError(
+            f"Modelo '{model}' no está disponible en {base_url}.\n"
+            f"Modelos visibles (muestra): {sample}\n"
+            f"Prueba con --model <otro> o revisa el scope de tu API key.",
+            exit_code=7,
+        )
+
+
 def run_preflight(model: str = DEFAULT_MODEL,
                   host: str = DEFAULT_HOST,
                   *,
                   auto_pull: bool = False,
                   skip_ollama: bool = False,
-                  skip_model: bool = False) -> None:
-    """Ejecuta todos los chequeos. Lanza PreflightError si alguno falla."""
+                  skip_model: bool = False,
+                  openai_base_url: str | None = None,
+                  openai_api_key: str | None = None) -> None:
+    """Ejecuta todos los chequeos. Lanza PreflightError si alguno falla.
+
+    Si ``model`` es de la familia OpenAI (prefijo ``gpt-``, ``o1-``...)
+    se valida contra el endpoint de OpenAI en vez de Ollama.
+    """
+    if _looks_like_openai_model(model or DEFAULT_MODEL):
+        # Backend OpenAI: validar API key + modelo.
+        if not skip_model:
+            check_openai(
+                model=model,
+                base_url=openai_base_url or DEFAULT_OPENAI_BASE_URL,
+                api_key=openai_api_key,
+            )
+        return
+
     if not skip_ollama:
         check_ollama(host=host)
     if not skip_model:
