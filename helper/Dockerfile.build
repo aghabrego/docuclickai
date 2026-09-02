@@ -1,0 +1,24 @@
+# Dockerfile para construir el binario docuclickai portable.
+#
+# Base: python:3.11-bullseye  (Debian 11, GLIBC 2.31)
+# Esto garantiza que el binario resultante corra en cualquier Debian 11+
+# o Ubuntu 20.04+, sin requerir GLIBC 2.36+ como el build con python:3.12-bookworm.
+#
+# Uso (desde helper/):
+#   docker build -f Dockerfile.build -t docuclickai-builder .
+#
+# Solo es la imagen. El wrapper build-docker.sh la usa y extrae el binario.
+
+FROM python:3.11-bullseye
+
+# Instala PyInstaller y dependencias de runtime.
+# Copiamos requirements primero para cachear la capa de pip.
+WORKDIR /build
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
+
+# El código fuente se monta como volumen desde build-docker.sh,
+# así no requiere re-build de la imagen cuando cambia el código.
+WORKDIR /src
+ENTRYPOINT ["pyinstaller"]
