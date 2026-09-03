@@ -84,6 +84,14 @@ class EventPublisher:
             socket_connect_timeout=self._socket_timeout,
             socket_keepalive=True,
             decode_responses=True,
+            # Forzar RESP2: redis-py >= 4 envía HELLO al handshake y,
+            # si el servidor tiene `requirepass`, lo manda ANTES de
+            # AUTH y Redis >= 6 con ACL lo rechaza con:
+            #   "HELLO must be called with the client already
+            #    authenticated, otherwise the HELLO AUTH <user> <pass>
+            #    option can be used to authenticate the client and
+            #    select the RESP protocol version at the same time"
+            protocol=2,
         )
         # Ping explícito: si falla aquí, el caller decide.
         try:
