@@ -89,14 +89,25 @@ def main() -> int:
         return exc.exit_code
 
     # 2. Pre-check Redis (solo si no es --no-publish). Fail-hard limpio.
+    # IMPORTANTE: pasar `password` (si el server tiene requirepass) y
+    # `protocol=2` (RESP2). Sin `protocol=2`, redis-py >= 4 envía
+    # `HELLO 3` (RESP3) ANTES de autenticarse, y Redis >= 6 con ACL
+    # rechaza con: "HELLO must be called with the client already
+    # authenticated, otherwise the HELLO AUTH <user> <pass> option can
+    # be used to authenticate the client and select the RESP protocol
+    # version at the same time".
     if not args.no_publish:
         import redis as _redis  # noqa: PLC0415
+        import os as _os  # noqa: PLC0415
         try:
             r = _redis.Redis(
-                host=args.redis_host or "localhost",
-                port=args.redis_port or 6379,
+                host=args.redis_host or _os.environ.get("REDIS_HOST", "localhost"),
+                port=args.redis_port or int(_os.environ.get("REDIS_PORT", 6379)),
+                db=int(_os.environ.get("REDIS_DB", 0)),
+                password=args.redis_password if args.redis_password else _os.environ.get("REDIS_PASSWORD"),
                 socket_timeout=5.0,
                 socket_connect_timeout=5.0,
+                protocol=2,
             )
             r.ping()
             r.close()
