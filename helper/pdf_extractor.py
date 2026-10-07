@@ -12,9 +12,24 @@ from pypdf import PdfReader
 
 # Marca el inicio de cada sección principal del reporte.
 SECTION_HEADER = re.compile(r"^\s*Transfer\s+(In|Out)\s*$", re.IGNORECASE | re.MULTILINE)
-HEADER_LINE = re.compile(r"(\d{2}\s+Wen\s+\S+)\s+\d+\s*-Transferencias")
+# Header "<CODIGO> Wen <NOMBRE>" puede estar en la MISMA línea que "-Transferencias"
+# o en una línea anterior (separado por \n + espacios cuando pypdf hace layout mode).
+# p.ej. el PDF "REPORTE 45- SAN MIGUELITO" lo renderiza así:
+#     "15 Wen San Miguelito"
+#     "                Año Fiscal: 2026   45 -Transferencias"
+# donde el layout mode pega "2026" y "45" como "202645". Capturamos solo
+# "<COD> Wen <NOMBRE>" hasta encontrar el siguiente "Año Fiscal" o
+# "-Transferencias" (lo que aparezca primero), sin comernos el resto del header.
+HEADER_LINE = re.compile(
+    r"(\d{2}\s+Wen\s+(?:\S+\s+)*?\S+)"
+    r"(?=\s+(?:Año\s+Fiscal|-Transferencias))",
+    re.IGNORECASE,
+)
 PERIODO = re.compile(r"Periodo:\s*(\d+)")
-ANIO = re.compile(r"Año Fiscal:\s*(\d+)")
+# Año Fiscal puede estar pegado al número de reporte ("Año Fiscal: 202645")
+# por el layout mode de pypdf. Tomamos los primeros 4 dígitos y los validamos
+# como año razonable. Esto es más robusto que `\b` que falla con dígitos pegados.
+ANIO = re.compile(r"Año Fiscal:\s*(\d{4})")
 RANGO = re.compile(r"\d{2}/\d{2}/\d{4}\s*-\s*\d{2}/\d{2}/\d{4}")
 
 # Marca el inicio de un bloque de tienda. Debe ser EXACTAMENTE "<CODIGO> Wen <NOMBRE>"
@@ -295,7 +310,16 @@ def parse_header(full_text: str) -> dict:
     """Extrae origen, año fiscal, periodo y rango de fechas del header."""
     m_hdr = HEADER_LINE.search(full_text)
     origen = m_hdr.group(1).strip() if m_hdr else None
+    # Defensa: si el origen viene con ruido del header pegado
+    # (p.ej. "15 Wen San Miguelito Año Fiscal"), recortamos al patrón válido.
+    if origen:
+        m_clean = re.match(r"^(\d{2}\s+Wen\s+\S+(?:\s+\S+)*?)\s*(?:Año\s+Fiscal|-Transferencias|$)", origen)
+        if m_clean:
+            origen = m_clean.group(1).strip()
     anio = int(ANIO.search(full_text).group(1)) if ANIO.search(full_text) else None
+    # Validar año razonable: filtra matches incompletos del regex.
+    if anio is not None and not (2010 <= anio <= 2099):
+        anio = None
     periodo = int(PERIODO.search(full_text).group(1)) if PERIODO.search(full_text) else None
     rango = RANGO.search(full_text)
     return {
